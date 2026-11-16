@@ -147,7 +147,9 @@
   }
   function locked(m) { return !bundle.lehrer && m.ab && Date.now() < Date.parse(m.ab); }
   function mod(id) { return bundle.modules.filter(function (x) { return x.id === id; })[0]; }
-  function openTasks() { return bundle.modules.filter(function (m) { return !locked(m) && modProgress(m) < 1; }); }
+  // Abgeschlossen: Die Stunde ist gehalten (bis-Datum vorbei). Der Auftrag bleibt zum Wiederholen, zählt aber nicht mehr als offen.
+  function archived(m) { return !!m.bis && todayIso() > m.bis; }
+  function openTasks() { return bundle.modules.filter(function (m) { return !locked(m) && !archived(m) && modProgress(m) < 1; }); }
   function seenNews() { return LS.get('ln_news_' + bundle.id, {}); }
   function markNews(id) { var s = seenNews(); if (!s[id]) { s[id] = 1; LS.set('ln_news_' + bundle.id, s); } }
 
@@ -177,10 +179,10 @@
     { r: 'aktuelles', n: 'Aktuelles', k: 'Aktuelles', i: 'news' },
     { r: 'arbeitsplatz', n: 'Mein Arbeitsplatz', k: 'Arbeit', i: 'briefcase' },
     { r: 'wissen', n: 'Wissen & Vorlagen', k: 'Wissen', i: 'book' },
-    { r: 'kollegen', n: 'Kolleginnen & Kollegen', k: 'Team', i: 'users' },
+    { r: 'unternehmen', n: 'Unternehmen', k: 'Firma', i: 'building' },
     { r: 'akademie', n: 'Akademie', k: 'Akademie', i: 'cap' }
   ];
-  var SECTION = { mail: 'arbeitsplatz', tool: 'arbeitsplatz', doc: 'arbeitsplatz', news: 'aktuelles', postfach: 'arbeitsplatz', app: 'arbeitsplatz', m: 'arbeitsplatz', wiki: 'wissen', person: 'kollegen', unternehmen: 'kollegen', leitbild: 'kollegen' };
+  var SECTION = { mail: 'arbeitsplatz', tool: 'arbeitsplatz', doc: 'arbeitsplatz', news: 'aktuelles', postfach: 'arbeitsplatz', app: 'arbeitsplatz', m: 'arbeitsplatz', wiki: 'wissen', person: 'unternehmen', kollegen: 'unternehmen', leitbild: 'unternehmen', lindner: 'unternehmen' };
   function navLinks(sec, short) {
     var open = badgeCount();
     return NAV.map(function (it) {
@@ -292,6 +294,7 @@
     { href: '#/aktuelles', name: 'Kalender', icon: 'calendar', farbe: 'tuerkis', anchor: 'kalender' },
     { href: '#/kollegen', name: 'Personen', icon: 'users', farbe: 'lila' },
     { href: '#/unternehmen', name: 'Unternehmen', icon: 'building', farbe: 'navy' },
+    { href: '#/leitbild', name: 'Leitbild', icon: 'star', farbe: 'orange', nur: 'leitbild' },
     { href: '#/wissen', name: 'Wiki', icon: 'book', farbe: 'gruen' },
     { href: '#/akademie', name: 'Akademie', icon: 'cap', farbe: 'orange' }
   ];
@@ -312,15 +315,15 @@
       return tile(a.id === 'postfach' ? '#/postfach' : '#/app/' + a.id, a.name, a.icon, a.farbe, { ab: a.ab, badge: n });
     });
   }
-  function sharedTiles() { return SHARED_APPS.map(function (a) { return tile(a.href, a.name, a.icon, a.farbe); }); }
+  function sharedTiles() { return SHARED_APPS.filter(function (a) { return !a.nur || SH.firma[a.nur]; }).map(function (a) { return tile(a.href, a.name, a.icon, a.farbe); }); }
   function taskRow(m) {
     var meta = (bundle.post || {})[m.id] || {}, von = meta.von ? person(meta.von) : null;
     if (locked(m)) {
       return h('div', { class: 'trow locked' }, h('span', { class: 'av a-none', 'aria-hidden': 'true' }, icon('lock')),
         h('span', { class: 'trow-t' }, h('b', null, 'Neuer Auftrag angekündigt'), h('span', null, 'Erscheint am ' + fmtDate(m.ab) + ' im Postfach.')));
     }
-    var pr = modProgress(m), state = pr >= 1 ? ['erledigt', 'g'] : pr > 0 ? ['in Arbeit', 'o'] : ['neu', 'n'];
-    return h('a', { class: 'trow' + (pr === 0 ? ' unread' : ''), href: '#/m/' + m.id },
+    var pr = modProgress(m), arch = archived(m), state = pr >= 1 ? ['erledigt', 'g'] : arch ? ['zum Wiederholen', ''] : pr > 0 ? ['in Arbeit', 'o'] : ['neu', 'n'];
+    return h('a', { class: 'trow' + (pr === 0 && !arch ? ' unread' : ''), href: '#/m/' + m.id },
       von ? avatar(von) : h('span', { class: 'av a-none', 'aria-hidden': 'true' }, icon('mail')),
       h('span', { class: 'trow-t' },
         h('span', { class: 'trow-from' }, von ? pname(von) : 'Lindner Bürowelt', meta.d ? h('time', null, fmtShort(meta.d)) : null),
@@ -328,6 +331,13 @@
         h('span', { class: 'bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(Math.round(pr * 100)), 'aria-label': 'Fortschritt' }, h('i', { style: 'width:' + Math.round(pr * 100) + '%' }))),
       h('span', { class: 'pill ' + state[1] }, state[0]));
   }
+  function lsRow(m) {
+    var pr = modProgress(m), n = m.steps.filter(function (s) { return INTERACTIVE[s.t] && s.t !== 'reflect'; }).length;
+    return h('a', { class: 'lrow', href: '#/m/' + m.id }, h('span', { class: 'lrow-i ls-i' }, m.icon || icon('folder')),
+      h('span', { class: 'lrow-t' }, h('b', null, m.thema || m.title), h('span', null, (m.std ? m.std + ' · ' : '') + '„' + m.title + '“' + (n ? ' · ' + n + (n === 1 ? ' Übung' : ' Übungen') : ''))),
+      pr >= 1 ? h('span', { class: 'pill g' }, 'erledigt') : icon('chevron'));
+  }
+
   function newsCard(n, big) {
     var von = person(n.von), neu = !seenNews()[n.id];
     return h('a', { class: 'ncard' + (big ? ' big' : ''), href: '#/news/' + n.id },
@@ -368,7 +378,8 @@
         h('ol', null,
           h('li', null, h('b', null, 'Mein Arbeitsplatz: '), 'Hier liegen deine Aufträge. Eine rote Zahl zeigt, was noch offen ist.'),
           h('li', null, h('b', null, 'Wissen & Vorlagen: '), 'Nachschlagen wie im echten Betrieb: Leitfäden, Fachbegriffe, Lernkarten.'),
-          h('li', null, h('b', null, 'Akademie: '), 'Üben für Schulaufgabe und Abschlussprüfung. Dein Lernstand bleibt nur auf diesem Gerät.')),
+          h('li', null, h('b', null, 'Unternehmen: '), 'Wer wir sind: Steckbrief, Leitbild, Kolleginnen und Kollegen.'),
+          h('li', null, h('b', null, 'Akademie: '), 'Üben für Schulaufgabe und Abschlussprüfung, mit Tipps auf Abruf. Dein Lernstand bleibt nur auf diesem Gerät.')),
         h('button', { class: 'btn sec', type: 'button', onclick: function () { LS.set('ln_tour', 1); tour.remove(); } }, 'Verstanden'));
       add(app, tour);
     }
@@ -411,7 +422,9 @@
   /* ---------- Mein Arbeitsplatz ---------- */
   function viewArbeitsplatz() {
     add(app, head('Mein Arbeitsplatz', bundle.user.stelle + ' · ' + abt(bundle.user.abt).name));
-    add(app, section('Postfach', ['Alle Nachrichten', '#/postfach'], h('div', { class: 'card list' }, inboxRows())));
+    var akt = inbox().filter(function (x) { return !x.arch; }), alt = bundle.modules.filter(function (m) { return !locked(m) && archived(m); }).reverse();
+    add(app, section('Aktuell im Postfach', ['Alle Nachrichten', '#/postfach'], h('div', { class: 'card list' }, akt.length ? akt.map(function (x) { return x.row(); }) : h('p', { class: 'muted' }, 'Gerade liegt kein neuer Auftrag vor. Unten kannst du abgeschlossene Lernsituationen wiederholen.'))));
+    if (alt.length) add(app, section('Abgeschlossen – zum Wiederholen', ['Akademie', '#/akademie'], h('div', { class: 'card list' }, alt.map(lsRow))));
     add(app, section('Meine Apps', null, h('div', { class: 'tiles' }, roleTiles())));
     var tl = visibleTools();
     if (tl.length) add(app, section('Werkzeuge', null, h('div', { class: 'card list' }, tl.map(toolRow))));
@@ -480,8 +493,10 @@
       (s.att || []).forEach(function (a) { add(box, attachment(a)); });
     },
     chat: function (s, box) {
-      add(box, h('div', { class: 'callbar' }, h('span', { 'aria-hidden': 'true' }, s.icon || '📞'), s.bar));
-      add(box, h('div', { class: 'chat' }, s.lines.map(function (l) { return h('div', { class: 'bub' + (l.r ? ' r' : '') }, h('small', null, l.w), l.x); })));
+      var talk = [h('div', { class: 'callbar' }, h('span', { 'aria-hidden': 'true' }, s.icon || '📞'), s.bar),
+        h('div', { class: 'chat' }, s.lines.map(function (l) { return h('div', { class: 'bub' + (l.r ? ' r' : '') }, h('small', null, l.w), l.x); }))];
+      if (s.fold) add(box, h('details', { class: 'att talk' }, h('summary', null, '📞 Gespräch nachlesen'), h('div', { class: 'att-b' }, talk)));
+      else add(box, talk);
       if (s.task) add(box, h('p', { class: 'why', html: s.task }));
     },
     info: function (s, box) {
@@ -492,18 +507,35 @@
       if (s.merk) add(box, h('div', { class: 'merk', html: s.merk }));
       (s.att || []).forEach(function (a) { add(box, attachment(a)); });
     },
+    // Gestufte Hilfe: Tipp 1 (Hinweis oder zwei falsche Antworten weg), Tipp 2 (Nachschlagen), zweiter Versuch nach einem Fehler.
+    // Volle Punkte gibt es nur ohne Hilfe im ersten Versuch, sonst einen halben Punkt.
     quiz: function (s, box, done) {
       var answered = 0, right = 0, res = h('div', { role: 'status', 'aria-live': 'polite' });
       s.qs.forEach(function (q, qi) {
-        var why = h('div'), btns = q.a.map(function (txt, ai) {
+        var st = { tips: 0, tries: 0, over: false }, fb = h('div', { 'aria-live': 'polite' }), tipBox = h('div');
+        var btns = q.a.map(function (txt, ai) {
           return h('button', { class: 'opt', type: 'button', onclick: function () {
-            btns.forEach(function (b, bi) { b.disabled = true; if (bi === q.c) b.classList.add('ok'); });
-            if (ai === q.c) right++; else btns[ai].classList.add('bad');
-            add(why, h('div', { class: 'why' }, h('strong', null, ai === q.c ? 'Richtig. ' : 'Nicht ganz. '), q.why ? rich(q.why) : null));
-            if (++answered === s.qs.length) { done(right, s.qs.length); add(res, result(right, s.qs.length, function () { go(); })); }
+            if (st.over) return;
+            if (ai === q.c) finish(true);
+            else if (st.tries === 0 && q.a.length > 2) {
+              st.tries = 1; btns[ai].classList.add('bad'); btns[ai].disabled = true; fb.textContent = '';
+              add(fb, h('div', { class: 'fb bad' }, 'Noch nicht ganz. Du hast einen zweiten Versuch.'));
+              if (st.tips === 0) { st.tips = 1; }
+              paintTips();
+            } else { btns[ai].classList.add('bad'); finish(false); }
           } }, txt);
         });
-        add(box, h('div', { class: 'q' }, h('p', null, (qi + 1) + '. ', rich(q.q)), q.ctx ? h('div', { class: 'ex', style: 'margin-bottom:8px' }, q.ctx) : null, h('div', { class: 'opts' }, btns), why));
+        function finish(ok) {
+          st.over = true; fb.textContent = '';
+          btns.forEach(function (b, bi) { b.disabled = true; if (bi === q.c) b.classList.add('ok'); });
+          var pts = ok ? (st.tips || st.tries ? 0.5 : 1) : 0; right += pts;
+          add(fb, h('div', { class: 'why' }, h('strong', null, ok ? (pts === 1 ? 'Richtig. ' : 'Richtig, mit Hilfe. ') : 'Die richtige Antwort ist markiert. '), q.why ? rich(q.why) : null));
+          paintTips();
+          if (++answered === s.qs.length) { done(right, s.qs.length); add(res, result(right, s.qs.length, function () { go(); })); }
+        }
+        function paintTips() { helpSteps(tipBox, st, { tip: q.tip, help: q.help || s.help, joker: function () { joker(btns, q.c); } }, paintTips); }
+        add(box, h('div', { class: 'q' }, h('p', null, (qi + 1) + '. ', rich(q.q)), q.ctx ? h('div', { class: 'ex', style: 'margin-bottom:8px' }, q.ctx) : null, h('div', { class: 'opts' }, btns), tipBox, fb));
+        paintTips();
       });
       add(box, res);
     },
@@ -514,16 +546,28 @@
       function show() {
         area.textContent = '';
         if (i >= items.length) { done(right, items.length); add(area, result(right, items.length, function () { go(); })); return; }
-        var it = items[i], fb = h('div');
+        var it = items[i], fb = h('div'), tipBox = h('div'), st = { tips: 0, tries: 0, over: false };
         var btns = s.buckets.map(function (b, bi) {
           return h('button', { class: 'opt', type: 'button', onclick: function () {
+            if (st.over) return;
+            var ok = bi === it.b;
+            if (!ok && st.tries === 0 && s.buckets.length > 2) {
+              st.tries = 1; btns[bi].classList.add('bad'); btns[bi].disabled = true; fb.textContent = '';
+              add(fb, h('div', { class: 'fb bad' }, 'Noch nicht ganz. Du hast einen zweiten Versuch.'));
+              if (st.tips === 0) st.tips = 1;
+              paintTips(); return;
+            }
+            st.over = true; fb.textContent = '';
             btns.forEach(function (x, xi) { x.disabled = true; if (xi === it.b) x.classList.add('ok'); });
-            var ok = bi === it.b; if (ok) right++; else btns[bi].classList.add('bad');
-            add(fb, h('div', { class: 'fb ' + (ok ? 'ok' : 'bad') }, ok ? 'Richtig!' : 'Richtig wäre: ' + s.buckets[it.b], it.why ? ' ' + it.why : ''));
+            var pts = ok ? (st.tips || st.tries ? 0.5 : 1) : 0; right += pts; if (!ok) btns[bi].classList.add('bad');
+            add(fb, h('div', { class: 'fb ' + (ok ? 'ok' : 'bad') }, ok ? (pts === 1 ? 'Richtig!' : 'Richtig, mit Hilfe.') : 'Richtig wäre: ' + s.buckets[it.b], it.why ? ' ' + it.why : ''));
             add(fb, h('button', { class: 'btn', type: 'button', onclick: function () { i++; show(); } }, i === items.length - 1 ? 'Auswertung' : 'Nächste Karte →'));
+            paintTips();
           } }, b);
         });
-        add(area, [h('p', { class: 'small muted' }, 'Karte ' + (i + 1) + ' von ' + items.length), h('div', { class: 'sortcard' }, it.x), h('div', { class: 'buckets' }, btns), fb]);
+        function paintTips() { helpSteps(tipBox, st, { tip: it.tip, help: it.help || s.help, joker: function () { joker(btns, it.b); } }, paintTips); }
+        add(area, [h('p', { class: 'small muted' }, 'Karte ' + (i + 1) + ' von ' + items.length), h('div', { class: 'sortcard' }, it.x), h('div', { class: 'buckets' }, btns), tipBox, fb]);
+        paintTips();
       }
       show();
     },
@@ -561,6 +605,24 @@
     }
   };
 
+  // Nimmt die Hälfte der falschen Antworten aus dem Spiel.
+  function joker(btns, c) {
+    var wrong = [], open = 0;
+    btns.forEach(function (b, i) { if (!b.disabled) { open++; if (i !== c) wrong.push(b); } });
+    shuffle(wrong).slice(0, Math.max(1, Math.floor(wrong.length / 2))).forEach(function (b) { if (open > 2) { b.disabled = true; b.classList.add('gone'); open--; } });
+  }
+  // Zeigt die bisher geholten Tipps und den Knopf für den nächsten. o: { tip: Text, help: { m, s } Verweis auf einen Wissens-Schritt, joker: Funktion }
+  function helpSteps(el, st, o, repaint) {
+    var hm = o.help ? mod(o.help.m) : null, hs = hm ? hm.steps[o.help.s] : null, max = hs ? 2 : 1;
+    el.textContent = '';
+    if (st.tips >= 1) {
+      if (!st.jok && !o.tip) { st.jok = 1; o.joker(); }
+      add(el, h('div', { class: 'tip' }, h('b', null, 'Tipp 1: '), o.tip ? rich(o.tip) : 'Ein Teil der falschen Antworten ist jetzt ausgegraut.'));
+    }
+    if (st.tips >= 2 && hs) add(el, h('details', { class: 'tip', open: 'open' }, h('summary', null, h('b', null, 'Tipp 2: '), 'Nachschlagen – ' + hs.title),
+      h('div', { class: 'tip-b' }, (hs.items || []).map(function (it) { return h('div', { class: 'tip-i' }, h('b', null, it.h + ': '), h('span', { html: Array.isArray(it.p) ? it.p.join(' ') : (it.p || '') }), it.ex ? h('em', null, ' ' + it.ex) : null); }))));
+    if (!st.over && st.tips < max) add(el, h('button', { type: 'button', class: 'btn ghost tipbtn', onclick: function () { st.tips++; repaint(); } }, '💡 ', st.tips ? 'Noch einen Tipp' : 'Tipp anzeigen', ' (' + (st.tips + 1) + ' von ' + max + ')'));
+  }
   function attachment(a) {
     return h('details', { class: 'att' }, h('summary', null, '📎 ', a.name),
       h('div', { class: 'att-b' }, a.pre ? h('pre', { class: 'doc' }, a.pre) : null, a.quote ? h('p', null, h('em', null, a.quote)) : null, a.body ? paras(a.body) : null));
@@ -570,7 +632,7 @@
   }
   function result(right, total, again) {
     var pct = right / total, text = pct === 1 ? 'Stark, alles richtig!' : pct >= 0.7 ? 'Gut gemacht!' : 'Schau dir die Erklärungen noch einmal an.';
-    return h('div', { class: 'score' }, h('b', null, right + ' / ' + total), h('p', null, text), h('button', { class: 'btn sec', type: 'button', onclick: again }, 'Noch einmal'));
+    return h('div', { class: 'score' }, h('b', null, String(right).replace('.', ',') + ' / ' + total), h('p', null, text), h('button', { class: 'btn sec', type: 'button', onclick: again }, 'Noch einmal'));
   }
 
 
@@ -650,7 +712,7 @@
     var s = seen('mail'), items = bundle.mails.map(function (m) { return { d: m.d + (m.z || ''), neu: !s[m.id], von: m.von, betreff: m.betreff, href: '#/mail/' + m.id, row: function () { return mailRow(m); } }; });
     bundle.modules.forEach(function (m) {
       var meta = (bundle.post || {})[m.id] || {};
-      items.push({ d: (meta.d || '') + '99', neu: !locked(m) && modProgress(m) < 1, von: meta.von, betreff: meta.betreff || m.title, href: '#/m/' + m.id, row: function () { return taskRow(m); } });
+      items.push({ arch: !locked(m) && archived(m), d: (meta.d || '') + '99', neu: !locked(m) && !archived(m) && modProgress(m) < 1, von: meta.von, betreff: meta.betreff || m.title, href: '#/m/' + m.id, row: function () { return taskRow(m); } });
     });
     return items.sort(function (a, b) { return b.d.localeCompare(a.d); });
   }
@@ -940,21 +1002,21 @@
       var f = norm(q), hits = SH.personen.filter(function (p) { return (!cur || p.abt === cur) && (!f || norm(pname(p) + ' ' + p.fn + ' ' + abt(p.abt).name).indexOf(f) >= 0); });
       add(list, hits.length ? hits.map(function (p) { return personRow(p); }) : h('p', { class: 'muted' }, 'Niemand gefunden.'));
     }
-    add(app, [head('Kolleginnen & Kollegen', SH.personen.length + ' Beschäftigte in ' + (SH.abteilungen.length - 2) + ' Abteilungen'),
+    add(app, [crumb([['Unternehmen', '#/unternehmen'], ['Kolleginnen & Kollegen']]), firmaNav('kollegen'), head('Kolleginnen & Kollegen', SH.personen.length + ' Beschäftigte in ' + (SH.abteilungen.length - 2) + ' Abteilungen'),
       h('div', { class: 'orgchart' }, SH.abteilungen.map(function (a) {
         var l = person(a.leitung), n = SH.personen.filter(function (p) { return p.abt === a.id; }).length;
         return h('button', { type: 'button', class: 'orgbox a-' + a.id, onclick: function () { cur = a.id; draw(); list.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, h('b', null, a.name), h('span', null, (a.id === 'az' ? 'Ausbilder: ' : a.id === 'gf' ? '' : 'Leitung: ') + pname(l)), h('span', { class: 'small' }, n + (n === 1 ? ' Person' : ' Personen')));
       })),
       inp, chips, list,
       h('p', { class: 'small muted' }, icon('shield'), ' Der Status zeigt nur, ob jemand erreichbar ist. Den Grund einer Abwesenheit sieht hier niemand: Das sind persönliche Daten, die nur die Personalabteilung kennen darf.'),
-      h('a', { class: 'btn sec', href: '#/unternehmen' }, 'Über das Unternehmen')]);
+      ]);
     draw();
   }
   function viewPerson(nr) {
     var p = person(nr);
     if (!p) { location.hash = '#/kollegen'; return; }
     var a = abt(p.abt), chef = person(a.leitung);
-    add(app, [crumb([['Kolleginnen & Kollegen', '#/kollegen'], [a.name, '#/kollegen/' + a.id], [pname(p)]]),
+    add(app, [crumb([['Unternehmen', '#/unternehmen'], ['Kolleginnen & Kollegen', '#/kollegen'], [a.name, '#/kollegen/' + a.id], [pname(p)]]),
       h('div', { class: 'card profile' }, avatar(p, 'xl'),
         h('div', null, h('h1', null, pname(p)), h('p', { class: 'muted' }, p.fn), h('span', { class: 'st st-' + p.st }, STATUS[p.st])),
         h('dl', { class: 'facts' },
@@ -967,32 +1029,56 @@
     var team = SH.personen.filter(function (x) { return x.abt === p.abt && x.nr !== p.nr; });
     if (team.length) add(app, section('Im selben Team', null, h('div', { class: 'card list' }, team.map(function (x) { return personRow(x); }))));
   }
+  function firmaNav(cur) {
+    var items = [['unternehmen', 'Über uns', '#/unternehmen']];
+    if (SH.firma.leitbild) items.push(['leitbild', 'Unser Leitbild', '#/leitbild']);
+    items.push(['kollegen', 'Kolleginnen & Kollegen', '#/kollegen']);
+    return h('nav', { class: 'chips subnav', 'aria-label': 'Unternehmen' }, items.map(function (it) {
+      return h('a', { class: 'chip' + (it[0] === cur ? ' on' : ''), href: it[2], 'aria-current': it[0] === cur ? 'page' : null }, it[1]);
+    }));
+  }
   function viewUnternehmen() {
-    var F = SH.firma;
-    add(app, [crumb([['Kolleginnen & Kollegen', '#/kollegen'], ['Unternehmen']]),
-      h('div', { class: 'card' },
-        h('img', { src: 'assets/logo_farbig.png', alt: F.name, style: 'max-width:320px;width:100%;display:block;margin:0 auto 10px' }),
-        h('div', { class: 'stats' }, F.facts.map(function (f) { return h('div', { class: 'stat' }, h('b', null, f[0]), h('span', null, f[1])); })),
-        h('p', { class: 'muted small', style: 'text-align:center;margin:0' }, 'Leitbild: „' + F.claim + '“'),
-        F.leitbild ? h('div', { class: 'row', style: 'justify-content:center;margin-top:12px' }, h('a', { class: 'btn', href: '#/leitbild' }, 'Unser Leitbild und unsere Ziele')) : null),
+    var F = SH.firma, gfp = person(SH.gf.von);
+    add(app, [firmaNav('unternehmen'),
+      h('section', { class: 'fhero' }, h('img', { class: 'fhero-bg', src: SH.gf.bild, alt: SH.gf.bildtext }),
+        h('div', { class: 'fhero-t' }, h('img', { src: 'assets/logo_weiss.png', alt: F.name }), h('p', null, '„' + F.claim + '“'))),
+      h('div', { class: 'stats' }, F.facts.map(function (f) { return h('div', { class: 'stat' }, h('b', null, f[0]), h('span', null, f[1])); })),
+      F.leitbild ? h('a', { class: 'lbteaser', href: '#/leitbild' }, h('span', { class: 'lrow-i' }, icon('star')),
+        h('span', { class: 'lrow-t' }, h('b', null, 'Unser Leitbild und unsere Ziele'), h('span', null, 'Sechs Leitsätze: So arbeiten wir – und das dürfen Kunden von uns erwarten.')), icon('chevron')) : null,
       h('div', { class: 'grid' },
         h('div', { class: 'card' }, h('h2', null, 'Steckbrief'), ul(F.steckbrief)),
         h('div', { class: 'card' }, h('h2', null, 'Unser Sortiment'), ul(F.sortiment)),
         h('div', { class: 'card' }, h('h2', null, 'Unsere Kunden'), ul(F.kunden)),
         h('div', { class: 'card' }, h('h2', null, 'Wichtige Geschäftspartner'), ul(F.partner))),
       h('div', { class: 'card' }, h('h2', null, 'So arbeiten wir bei Lindner'), ul(F.regeln)),
-      h('a', { class: 'btn sec', href: '#/kollegen' }, 'Zum Personenverzeichnis')]);
+      section('Unser Team', ['Alle ' + SH.personen.length + ' Kolleginnen & Kollegen', '#/kollegen'],
+        h('div', { class: 'card list' }, [gfp].concat(SH.abteilungen.filter(function (a) { return a.id !== 'gf' && a.id !== 'az'; }).map(function (a) { return person(a.leitung); })).map(function (p) { return personRow(p); })))]);
   }
-
+  var LB_ICONS = ['users', 'handshake', 'check', 'scale', 'idcard', 'star'];
   function viewLeitbild() {
     var F = SH.firma, L = F.leitbild;
     if (!L) { location.hash = '#/unternehmen'; return; }
-    add(app, [crumb([['Kolleginnen & Kollegen', '#/kollegen'], ['Unternehmen', '#/unternehmen'], ['Unser Leitbild']]),
-      head('Unser Leitbild', F.name),
-      h('div', { class: 'card' }, h('div', { class: 'merk', html: '„' + F.claim + '“' }), paras(L.intro),
-        L.saetze.map(function (x, i) { return h('div', { class: 'info' }, h('h3', null, (i + 1) + '  ' + x[0]), paras(x[1])); })),
-      h('div', { class: 'card' }, h('h2', null, 'Unsere Ziele für ' + L.jahr), ul(L.ziele), h('p', { class: 'small muted', style: 'margin-bottom:0' }, L.von)),
-      h('a', { class: 'btn sec', href: '#/unternehmen' }, '← Über das Unternehmen')]);
+    var sel = -1, detail = h('div', { class: 'lb-detail', role: 'status', 'aria-live': 'polite' });
+    var cols = L.saetze.map(function (x, i) {
+      return h('button', { type: 'button', class: 'lb-col', 'aria-expanded': 'false', onclick: function () { sel = sel === i ? -1 : i; paint(); } },
+        h('span', { class: 'lb-n' }, String(i + 1)), h('span', { class: 'lb-i' }, icon(LB_ICONS[i % LB_ICONS.length])), h('span', { class: 'lb-t' }, x[0].replace(/\.$/, '')));
+    });
+    function paint() {
+      cols.forEach(function (c, i) { c.classList.toggle('on', i === sel); c.setAttribute('aria-expanded', i === sel ? 'true' : 'false'); });
+      detail.textContent = '';
+      if (sel < 0) add(detail, h('p', { class: 'muted small', style: 'margin:0;text-align:center' }, 'Tippe auf eine Säule, um den Leitsatz zu lesen.'));
+      else add(detail, [h('h3', null, (sel + 1) + '  ' + L.saetze[sel][0]), h('p', { style: 'margin:0' }, L.saetze[sel][1])]);
+    }
+    add(app, [firmaNav('leitbild'), head('Unser Leitbild', F.name), h('p', null, L.intro),
+      h('div', { class: 'lbhaus' },
+        h('div', { class: 'lb-dach' }, h('span', null, '„' + F.claim + '“')),
+        h('div', { class: 'lb-balken' }, 'Unsere sechs Leitsätze'),
+        h('div', { class: 'lb-cols' }, cols), detail,
+        h('div', { class: 'lb-fund' }, h('h2', null, 'Unser Fundament: Ziele für ' + L.jahr), ul(L.ziele))),
+      h('p', { class: 'small muted', style: 'text-align:right' }, L.von),
+      h('details', { class: 'att' }, h('summary', null, icon('file'), ' Alle Leitsätze als Liste lesen'),
+        h('div', { class: 'att-b' }, L.saetze.map(function (x, i) { return h('div', { class: 'info' }, h('h3', null, (i + 1) + '  ' + x[0]), paras(x[1])); })))]);
+    paint();
   }
 
   /* ---------- Akademie ---------- */
@@ -1005,13 +1091,13 @@
         var d = p.done[m.id + ':' + i];
         rows.push(h('a', { class: 'lrow', href: '#/m/' + m.id + '/' + i }, h('span', { class: 'lrow-i' }, icon(s.t === 'calc' ? 'chart' : s.t === 'sort' ? 'cards' : 'check')),
           h('span', { class: 'lrow-t' }, h('b', null, s.title), h('span', null, (s.t === 'quiz' ? 'Quiz' : s.t === 'sort' ? 'Kartenspiel' : 'Rechnen') + ' · ' + m.title)),
-          d ? h('span', { class: 'pill ' + (d.max && d.pts >= d.max ? 'g' : 'o') }, d.max ? d.pts + ' / ' + d.max : 'geübt') : h('span', { class: 'pill n' }, 'offen')));
+          d ? h('span', { class: 'pill ' + (d.max && d.pts >= d.max ? 'g' : 'o') }, d.max ? String(d.pts).replace('.', ',') + ' / ' + d.max : 'geübt') : h('span', { class: 'pill n' }, 'offen')));
       });
     });
     visibleTools().forEach(function (t) { if (t.typ === 'quiz' || t.typ === 'detektiv') rows.unshift(toolRow(t)); });
     add(app, [head('Akademie', 'Üben für Schulaufgabe und Abschlussprüfung'),
       h('div', { class: 'stats' },
-        h('div', { class: 'stat' }, h('b', null, String(totalPoints())), h('span', null, 'Punkte auf diesem Gerät')),
+        h('div', { class: 'stat' }, h('b', null, String(totalPoints()).replace('.', ',')), h('span', null, 'Punkte auf diesem Gerät')),
         h('div', { class: 'stat' }, h('b', null, bundle.modules.filter(function (m) { return !locked(m) && modProgress(m) >= 1; }).length + ' / ' + bundle.modules.filter(function (m) { return !locked(m); }).length), h('span', null, 'Aufträge erledigt')),
         h('div', { class: 'stat' }, h('b', null, String(bundle.glossary.length)), h('span', null, 'Fachbegriffe im Wiki'))),
       section('Unser Weg durch ' + bundle.short, null, h('div', { class: 'card' }, h('p', { class: 'muted small' }, bundle.title),
