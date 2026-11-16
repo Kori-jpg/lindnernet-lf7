@@ -135,6 +135,16 @@
   function modProgress(m) { var p = prog(), n = 0; m.steps.forEach(function (s, i) { if (p.done[m.id + ':' + i]) n++; }); return n / m.steps.length; }
   function badgeCount() { return openTasks().length + unreadMails().length + unreadChat(); }
   function totalPoints() { var p = prog(), t = 0, k; for (k in p.done) t += p.done[k].pts || 0; return t; }
+  // Lernpfad: Einträge mit Datum (d) werden automatisch erledigt bzw. aktuell, feste Angaben (s) haben Vorrang.
+  function roadList() {
+    var t = todayIso(), now = false;
+    return bundle.road.map(function (r) {
+      var st = r.s;
+      if (!st && r.d) { if (r.d < t) st = 'done'; else if (!now) { st = 'now'; now = true; } }
+      else if (st === 'now') now = true;
+      return { t: r.t, s: st };
+    });
+  }
   function locked(m) { return !bundle.lehrer && m.ab && Date.now() < Date.parse(m.ab); }
   function mod(id) { return bundle.modules.filter(function (x) { return x.id === id; })[0]; }
   function openTasks() { return bundle.modules.filter(function (m) { return !locked(m) && modProgress(m) < 1; }); }
@@ -170,7 +180,7 @@
     { r: 'kollegen', n: 'Kolleginnen & Kollegen', k: 'Team', i: 'users' },
     { r: 'akademie', n: 'Akademie', k: 'Akademie', i: 'cap' }
   ];
-  var SECTION = { mail: 'arbeitsplatz', tool: 'arbeitsplatz', doc: 'arbeitsplatz', news: 'aktuelles', postfach: 'arbeitsplatz', app: 'arbeitsplatz', m: 'arbeitsplatz', wiki: 'wissen', person: 'kollegen', unternehmen: 'kollegen' };
+  var SECTION = { mail: 'arbeitsplatz', tool: 'arbeitsplatz', doc: 'arbeitsplatz', news: 'aktuelles', postfach: 'arbeitsplatz', app: 'arbeitsplatz', m: 'arbeitsplatz', wiki: 'wissen', person: 'kollegen', unternehmen: 'kollegen', leitbild: 'kollegen' };
   function navLinks(sec, short) {
     var open = badgeCount();
     return NAV.map(function (it) {
@@ -231,6 +241,7 @@
       case 'kollegen': viewKollegen(parts[1]); break;
       case 'person': viewPerson(parseInt(parts[1], 10)); break;
       case 'unternehmen': case 'lindner': viewUnternehmen(); break;
+      case 'leitbild': viewLeitbild(); break;
       case 'akademie': viewAkademie(); break;
       case 'suche': viewSuche(decodeURIComponent(route.slice(6))); break;
       case 'datenschutz': viewDatenschutz(); break;
@@ -962,7 +973,8 @@
       h('div', { class: 'card' },
         h('img', { src: 'assets/logo_farbig.png', alt: F.name, style: 'max-width:320px;width:100%;display:block;margin:0 auto 10px' }),
         h('div', { class: 'stats' }, F.facts.map(function (f) { return h('div', { class: 'stat' }, h('b', null, f[0]), h('span', null, f[1])); })),
-        h('p', { class: 'muted small', style: 'text-align:center;margin:0' }, 'Leitbild: „' + F.claim + '“')),
+        h('p', { class: 'muted small', style: 'text-align:center;margin:0' }, 'Leitbild: „' + F.claim + '“'),
+        F.leitbild ? h('div', { class: 'row', style: 'justify-content:center;margin-top:12px' }, h('a', { class: 'btn', href: '#/leitbild' }, 'Unser Leitbild und unsere Ziele')) : null),
       h('div', { class: 'grid' },
         h('div', { class: 'card' }, h('h2', null, 'Steckbrief'), ul(F.steckbrief)),
         h('div', { class: 'card' }, h('h2', null, 'Unser Sortiment'), ul(F.sortiment)),
@@ -970,6 +982,17 @@
         h('div', { class: 'card' }, h('h2', null, 'Wichtige Geschäftspartner'), ul(F.partner))),
       h('div', { class: 'card' }, h('h2', null, 'So arbeiten wir bei Lindner'), ul(F.regeln)),
       h('a', { class: 'btn sec', href: '#/kollegen' }, 'Zum Personenverzeichnis')]);
+  }
+
+  function viewLeitbild() {
+    var F = SH.firma, L = F.leitbild;
+    if (!L) { location.hash = '#/unternehmen'; return; }
+    add(app, [crumb([['Kolleginnen & Kollegen', '#/kollegen'], ['Unternehmen', '#/unternehmen'], ['Unser Leitbild']]),
+      head('Unser Leitbild', F.name),
+      h('div', { class: 'card' }, h('div', { class: 'merk', html: '„' + F.claim + '“' }), paras(L.intro),
+        L.saetze.map(function (x, i) { return h('div', { class: 'info' }, h('h3', null, (i + 1) + '  ' + x[0]), paras(x[1])); })),
+      h('div', { class: 'card' }, h('h2', null, 'Unsere Ziele für ' + L.jahr), ul(L.ziele), h('p', { class: 'small muted', style: 'margin-bottom:0' }, L.von)),
+      h('a', { class: 'btn sec', href: '#/unternehmen' }, '← Über das Unternehmen')]);
   }
 
   /* ---------- Akademie ---------- */
@@ -992,7 +1015,7 @@
         h('div', { class: 'stat' }, h('b', null, bundle.modules.filter(function (m) { return !locked(m) && modProgress(m) >= 1; }).length + ' / ' + bundle.modules.filter(function (m) { return !locked(m); }).length), h('span', null, 'Aufträge erledigt')),
         h('div', { class: 'stat' }, h('b', null, String(bundle.glossary.length)), h('span', null, 'Fachbegriffe im Wiki'))),
       section('Unser Weg durch ' + bundle.short, null, h('div', { class: 'card' }, h('p', { class: 'muted small' }, bundle.title),
-        h('ol', { class: 'road' }, bundle.road.map(function (r) { return h('li', { class: r.s || null }, (r.s === 'done' ? '✓ ' : '') + r.t); })))),
+        h('ol', { class: 'road' }, roadList().map(function (r) { return h('li', { class: r.s || null }, (r.s === 'done' ? '✓ ' : '') + r.t); })))),
       section('Prüfungstraining', null, h('div', { class: 'card list' }, rows.length ? rows : h('p', { class: 'muted' }, 'Übungen erscheinen hier mit deinen Aufträgen.'),
         h('a', { class: 'lrow', href: '#/wissen/karten' }, h('span', { class: 'lrow-i' }, icon('cards')), h('span', { class: 'lrow-t' }, h('b', null, 'Lernkarten'), h('span', null, 'Fachbegriffe wiederholen')), icon('chevron')))),
       h('p', { class: 'small muted' }, 'Dein Lernstand wird nicht übertragen. Er liegt nur im Browser dieses Geräts.')]);
