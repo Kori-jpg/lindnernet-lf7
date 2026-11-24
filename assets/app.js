@@ -1,9 +1,11 @@
 /* LindnerNet – Intranet der Lindner Bürowelt am Main KG (Modellunternehmen für den Unterricht).
-   Keine Konten, kein Tracking: Lernstand bleibt im Browser. Inhalte werden erst mit dem Klassencode entschlüsselt. */
+   Keine Konten, kein Tracking: Kürzel und Lernstand bleiben im Browser. Inhalte werden erst mit dem Code der Stunde entschlüsselt. */
 (function () {
   'use strict';
 
-  var BUNDLES = (document.documentElement.getAttribute('data-bundles') || 'lf7,lf8').split(',');
+  var SITE = (document.documentElement.getAttribute('data-bundles') || 'lf7').split(',')[0];
+  /* Eigene Schlüssel je Seite: LF 7 und LF 8 liegen auf derselben Adresse (kori-jpg.github.io) und teilen sich den Speicher. */
+  var K_USER = 'lb' + SITE.replace(/\D/g, '') + '_user', K_CODE = 'lb' + SITE.replace(/\D/g, '') + '_code';
   var app = document.getElementById('app');
   var side = document.getElementById('side');
   var topbar = document.getElementById('topbar');
@@ -108,23 +110,83 @@
       return crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(enc.iv) }, key, b64(enc.ct));
     }).then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); });
   }
-  function unlock(code) {
-    var i = 0;
-    function next() {
-      if (i >= BUNDLES.length) return Promise.resolve(null);
-      var id = BUNDLES[i++];
-      return fetch('content/' + id + '.enc.json', { cache: 'no-cache' })
-        .then(function (r) { if (!r.ok) throw new Error('fetch'); return r.json(); })
-        .then(function (enc) { return decrypt(enc, code); })
-        .then(function (data) { return data; }, function () { return next(); });
-    }
-    return next();
+  function deriveKey(code, salt, iter) {
+    return crypto.subtle.importKey('raw', new TextEncoder().encode(normCode(code)), 'PBKDF2', false, ['deriveKey']).then(function (base) {
+      return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b64(salt), iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    });
   }
-  function setBundle(data) {
+  function gcmOpen(key, box) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(box.iv) }, key, b64(box.ct)).then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); }); }
+  var LOGIN = null;
+  function loginFile() {
+    if (LOGIN) return Promise.resolve(LOGIN);
+    return fetch('content/' + SITE + '.enc.json', { cache: 'no-cache' }).then(function (r) { if (!r.ok) throw new Error('fetch'); return r.json(); }).then(function (e) { LOGIN = e; return e; });
+  }
+  /* Prüft einen Code gegen alle Fächer der Anmeldedatei. Ergebnis: { k, units } oder null */
+  function openSlot(code) {
+    return loginFile().then(function (enc) {
+      return deriveKey(code, enc.salt, enc.iter).then(function (key) {
+        var i = 0;
+        function next() { if (i >= enc.slots.length) return null; return gcmOpen(key, enc.slots[i++]).then(null, next); }
+        return next();
+      });
+    });
+  }
+  /* Anmeldung: Code öffnet ein Fach, das Fach den Grundinhalt. Ergebnis: { data, units } oder null */
+  function unlock(code) {
+    return openSlot(code).then(function (slot) {
+      if (!slot) return null;
+      return crypto.subtle.importKey('raw', b64(slot.k), 'AES-GCM', false, ['decrypt'])
+        .then(function (key) { return gcmOpen(key, LOGIN); })
+        .then(function (data) { return { data: data, units: slot.units || [] }; });
+    }).then(null, function () { return null; });
+  }
+  function normUser(k) { return String(k || '').toUpperCase().replace(/[^A-ZÄÖÜ]/g, ''); }
+  /* Früheren Lernstand (vor dem Kürzel-Login) einmalig auf das erste Kürzel dieses Geräts übernehmen */
+  function migrate(id) {
+    var flag = 'ln_migr_' + SITE.replace(/\D/g, ''), re = new RegExp(SITE + '(?=_|$)');
+    if (LS.get(flag, 0)) return;
+    try {
+      var keys = [];
+      for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (re.test(k) && k.indexOf('@') < 0) keys.push(k); }
+      keys.forEach(function (k) { var n = k.replace(re, id); if (localStorage.getItem(n) == null) localStorage.setItem(n, localStorage.getItem(k)); localStorage.removeItem(k); });
+    } catch (e) { /* egal */ }
+    LS.set(flag, 1);
+  }
+  function addUnits(list) {
+    var l = LS.get(ckey(), []);
+    (list || []).forEach(function (u) { if (!l.some(function (x) { return x.f === u.f; })) l.push({ c: u.c, f: u.f }); });
+    LS.set(ckey(), l);
+  }
+  function setBundle(data, user) {
     bundle = data; SH = data ? data.shared : null;
     if (!data) return;
+    bundle.kuerzel = user; bundle.id = SITE + '@' + user;
     ['mails', 'chat', 'ablage', 'tools', 'news', 'termine', 'units'].forEach(function (k) { if (!bundle[k]) bundle[k] = []; });
-    bundle._applied = {};
+    bundle._applied = {}; bundle.stunden = []; bundle.fileStunde = {};
+    tagStunde(bundle, bundle.stunde || { id: 'basis', t: 'Grundlagen' });
+  }
+
+  /* ---------- Stunden und Modus (Unterricht / Üben) ---------- */
+  function tagStunde(u, st) {
+    if (!bundle.stunden.some(function (x) { return x.id === st.id; })) bundle.stunden.push(st);
+    function tag(x) { if (x && !x._s) x._s = st.id; }
+    ['mails', 'tools', 'news', 'termine', 'modules'].forEach(function (k) { (u[k] || []).forEach(tag); });
+    (u.chat || []).forEach(function (c) { (c.msgs || []).forEach(tag); });
+    (u.ablage || []).forEach(function (o) { (o.docs || []).forEach(tag); });
+  }
+  function modus() { return LS.get('ln_mode_' + bundle.id, { m: 'ue', s: null }); }
+  function setModus(m, sid) { var o = modus(); o.m = m; if (sid !== undefined) o.s = sid; LS.set('ln_mode_' + bundle.id, o); }
+  function aktStunde() { var o = modus(); return bundle.stunden.filter(function (x) { return x.id === o.s; })[0] || null; }
+  function unterricht() { return modus().m === 'u' && !!aktStunde(); }
+  /* Gehört ein Eintrag zur gewählten Stunde? Im Übungsmodus gilt alles. */
+  function inS(x) { return !unterricht() || (x && x._s === modus().s); }
+  function chatsS() { return bundle.chat.filter(function (c) { return !unterricht() || c.msgs.some(inS); }); }
+  function stundeLabel(st) { return st.t + (st.d ? ' (' + st.d + ')' : ''); }
+  function modusBar() {
+    var st = aktStunde(), u = unterricht();
+    return h('a', { class: 'modebar ' + (u ? 'm-u' : 'm-ue'), href: '#/code' }, icon(u ? 'briefcase' : 'cap'),
+      h('span', null, h('b', null, u ? 'Unterricht: ' + st.t : 'Üben: alles, was du freigeschaltet hast'), h('span', null, u ? 'Du siehst nur, was zu dieser Stunde gehört.' : 'Neuer Code oder zurück zum Unterricht? Hier entlang.')),
+      h('span', { class: 'modebar-go' }, 'Code & Modus', icon('chevron')));
   }
 
   /* ---------- Lernstand (nur lokal) ---------- */
@@ -149,7 +211,7 @@
   function mod(id) { return bundle.modules.filter(function (x) { return x.id === id; })[0]; }
   // Abgeschlossen: Die Stunde ist gehalten (bis-Datum vorbei). Der Auftrag bleibt zum Wiederholen, zählt aber nicht mehr als offen.
   function archived(m) { return !!m.bis && todayIso() > m.bis; }
-  function openTasks() { return bundle.modules.filter(function (m) { return !locked(m) && !archived(m) && modProgress(m) < 1; }); }
+  function openTasks() { return bundle.modules.filter(function (m) { return inS(m) && !locked(m) && !archived(m) && modProgress(m) < 1; }); }
   function seenNews() { return LS.get('ln_news_' + bundle.id, {}); }
   function markNews(id) { var s = seenNews(); if (!s[id]) { s[id] = 1; LS.set('ln_news_' + bundle.id, s); } }
 
@@ -159,7 +221,7 @@
   function fmtDate(iso) { return dparts(iso).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' }); }
   function fmtShort(iso) { var d = dparts(iso); return WT[d.getDay()] + ' ' + ('0' + d.getDate()).slice(-2) + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.'; }
   function todayIso() { var d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
-  function termine() { return SH.termine.concat(bundle.termine || []).sort(function (a, b) { return (a.d + a.z).localeCompare(b.d + b.z); }); }
+  function termine() { return SH.termine.concat((bundle.termine || []).filter(inS)).sort(function (a, b) { return (a.d + a.z).localeCompare(b.d + b.z); }); }
 
   /* ---------- Personen ---------- */
   function person(nr) { return SH.personen.filter(function (p) { return p.nr === nr; })[0]; }
@@ -180,7 +242,8 @@
     { r: 'arbeitsplatz', n: 'Mein Arbeitsplatz', k: 'Arbeit', i: 'briefcase' },
     { r: 'wissen', n: 'Wissen & Vorlagen', k: 'Wissen', i: 'book' },
     { r: 'unternehmen', n: 'Unternehmen', k: 'Firma', i: 'building' },
-    { r: 'akademie', n: 'Akademie', k: 'Akademie', i: 'cap' }
+    { r: 'akademie', n: 'Akademie', k: 'Akademie', i: 'cap' },
+    { r: 'code', n: 'Code & Modus', k: 'Code', i: 'key' }
   ];
   var SECTION = { mail: 'arbeitsplatz', tool: 'arbeitsplatz', doc: 'arbeitsplatz', news: 'aktuelles', postfach: 'arbeitsplatz', app: 'arbeitsplatz', m: 'arbeitsplatz', wiki: 'wissen', person: 'unternehmen', kollegen: 'unternehmen', leitbild: 'unternehmen', lindner: 'unternehmen' };
   function navLinks(sec, short) {
@@ -202,7 +265,7 @@
     document.body.className = bundle ? '' : 'anon';
     if (!bundle) {
       add(foot, [h('p', null, 'LindnerNet ist ein Lernangebot zum Unterricht. Die Lindner Bürowelt am Main KG ist ein Modellunternehmen: Alle Namen, Personen und Daten sind frei erfunden.'),
-        h('p', null, 'Diese Seite braucht keinen Namen und kein Konto und speichert keine persönlichen Daten.')]);
+        h('p', null, 'Diese Seite braucht keinen Namen und kein Konto. Dein Kürzel bleibt nur auf diesem Gerät.')]);
       return;
     }
     add(side, [
@@ -213,7 +276,7 @@
     add(topbar, [
       h('a', { class: 'top-logo', href: '#/', 'aria-label': 'LindnerNet Startseite' }, h('img', { src: 'assets/logo_kurz_weiss.png', alt: '' })),
       searchForm(q),
-      h('a', { class: 'me', href: '#/ich', 'aria-label': 'Mein Profil: ' + bundle.user.stelle }, h('span', { class: 'me-t' }, h('b', null, bundle.user.stelle), h('span', null, abt(bundle.user.abt).name)), h('span', { class: 'av a-' + bundle.user.abt }, bundle.user.kurz))
+      h('a', { class: 'me', href: '#/ich', 'aria-label': 'Mein Profil: ' + bundle.user.stelle }, h('span', { class: 'me-t' }, h('b', null, bundle.user.stelle), h('span', null, abt(bundle.user.abt).name)), h('span', { class: 'av a-' + bundle.user.abt }, bundle.kuerzel))
     ]);
     add(tabs, navLinks(sec, true));
     add(foot, [h('p', null, 'LindnerNet · Modellunternehmen für den Unterricht. Alle Namen, Personen und Daten sind frei erfunden.'),
@@ -245,6 +308,7 @@
       case 'unternehmen': case 'lindner': viewUnternehmen(); break;
       case 'leitbild': viewLeitbild(); break;
       case 'akademie': viewAkademie(); break;
+      case 'code': viewCode(); break;
       case 'suche': viewSuche(decodeURIComponent(route.slice(6))); break;
       case 'datenschutz': viewDatenschutz(); break;
       case 'ich': viewIch(); break;
@@ -263,27 +327,39 @@
   function head(title, sub) { return h('div', { class: 'phead' }, h('h1', null, title), sub ? h('p', { class: 'muted' }, sub) : null); }
 
   /* ---------- Anmeldung ---------- */
+  var UEBUNGSCODE = 'UEBEN';
   function viewLogin() {
-    var input = h('input', { type: 'text', name: 'code', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'Zugangscode', 'aria-label': 'Zugangscode', required: true });
+    var user = h('input', { type: 'text', name: 'username', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', maxlength: '3', placeholder: 'z. B. ABC', 'aria-label': 'Benutzername: dein Kürzel aus drei Buchstaben', required: true, value: LS.get(K_USER, '') || null });
+    var input = h('input', { type: 'text', name: 'code', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'Code der Stunde', 'aria-label': 'Passwort: Code der Stunde', required: true });
     var msg = h('div', { role: 'status', 'aria-live': 'polite' });
     var btn = h('button', { class: 'btn', type: 'submit' }, 'Anmelden');
-    var form = h('form', { class: 'code-form', onsubmit: function (e) {
+    function bad(t) { msg.textContent = ''; add(msg, h('p', { class: 'msg bad' }, t)); }
+    var form = h('form', { class: 'login-form', onsubmit: function (e) {
       e.preventDefault();
-      if (!window.crypto || !crypto.subtle) { msg.textContent = ''; add(msg, h('p', { class: 'msg bad' }, 'Dieser Browser kann LindnerNet nicht öffnen. Bitte nutze einen aktuellen Browser und die Adresse mit https.')); return; }
+      var k = normUser(user.value);
+      if (k.length !== 3) { bad('Dein Benutzername ist ein Kürzel aus genau drei Buchstaben, zum Beispiel ABC.'); user.focus(); return; }
+      if (!window.crypto || !crypto.subtle) { bad('Dieser Browser kann LindnerNet nicht öffnen. Bitte nutze einen aktuellen Browser und die Adresse mit https.'); return; }
       btn.disabled = true; btn.textContent = 'Prüfe …'; msg.textContent = '';
-      unlock(input.value).then(function (data) {
-        btn.disabled = false; btn.textContent = 'Anmelden';
-        if (!data) { add(msg, h('p', { class: 'msg bad' }, 'Dieser Code passt nicht. Bitte prüfe die Schreibweise oder frage deine Lehrkraft.')); return; }
-        setBundle(data); LS.set('lb_code', normCode(input.value)); location.hash = '#/'; loadUnits().then(go);
+      unlock(input.value).then(function (r) {
+        if (!r) { btn.disabled = false; btn.textContent = 'Anmelden'; bad('Dieser Code passt nicht. Bitte prüfe die Schreibweise oder frage deine Lehrkraft.'); return; }
+        btn.textContent = 'Lade Stunde …';
+        setBundle(r.data, k); migrate(bundle.id);
+        LS.set(K_USER, k); LS.set(K_CODE, normCode(input.value));
+        // Erst nach dem Laden der Stunden-Einheiten anzeigen, sonst blitzt kurz der Übungsmodus auf
+        useCode(r).then(function () { if (location.hash === '#/' || !location.hash) go(); else location.hash = '#/'; });
       });
-    } }, input, btn);
+    } },
+      h('label', { class: 'fld' }, h('span', null, 'Benutzername'), user, h('small', null, 'Dein Kürzel aus drei Buchstaben. Kein echter Name nötig.')),
+      h('label', { class: 'fld' }, h('span', null, 'Passwort'), input, h('small', null, 'Den Code der Stunde bekommst du von deiner Lehrkraft.')),
+      btn);
     add(app, h('div', { class: 'login' },
       h('img', { class: 'login-logo', src: 'assets/logo_weiss.png', alt: 'Lindner Bürowelt am Main KG' }),
       h('div', { class: 'login-card' },
         h('div', { class: 'kicker' }, 'Intranet'), h('h1', null, 'LindnerNet'),
-        h('p', { class: 'muted' }, 'Melde dich mit dem Zugangscode deiner Klasse an. Du brauchst keinen Namen und kein Konto.'),
-        form, msg,
-        h('p', { class: 'small muted', style: 'margin:14px 0 0' }, 'Den Code bekommst du von deiner Lehrkraft.'))));
+        form, msg),
+      h('div', { class: 'login-ueben' }, icon('key'),
+        h('div', null, h('b', null, 'Nur üben?'), h('span', null, 'Mit dem Code ', h('code', null, UEBUNGSCODE), ' kommst du jederzeit zu den Übungen.')),
+        h('button', { class: 'btn sec', type: 'button', onclick: function () { input.value = UEBUNGSCODE; (user.value ? btn : user).focus(); } }, 'Einsetzen'))));
   }
 
   /* ---------- Bausteine ---------- */
@@ -311,7 +387,7 @@
       var n = 0;
       if (a.id === 'postfach') n = open;
       else if (a.id === 'chat') n = unreadChat();
-      else (a.mods || []).forEach(function (id) { var m = mod(id); if (m && !locked(m) && modProgress(m) < 1) n++; });
+      else (a.mods || []).forEach(function (id) { var m = mod(id); if (m && inS(m) && !locked(m) && modProgress(m) < 1) n++; });
       return tile(a.id === 'postfach' ? '#/postfach' : '#/app/' + a.id, a.name, a.icon, a.farbe, { ab: a.ab, badge: n });
     });
   }
@@ -364,14 +440,14 @@
     var hr = new Date().getHours(), gruss = hr < 11 ? 'Guten Morgen!' : hr < 17 ? 'Guten Tag!' : 'Guten Abend!';
     var open = inbox().filter(function (x) { return x.neu; }), chef = person(bundle.user.chef), gfp = person(SH.gf.von);
     var heute = new Date().toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    add(app, modusBar());
     add(app, h('section', { class: 'greet' },
       h('div', null, h('p', { class: 'greet-d' }, heute), h('h1', null, gruss),
         h('p', null, open.length ? (open.length === 1 ? 'Du hast 1 neue Nachricht oder offenen Auftrag.' : 'Du hast ' + open.length + ' neue Nachrichten und offene Aufträge.') : 'Alles erledigt. Stark!', ' ', bundle.user.hinweis)),
       open.length ? h('div', { class: 'greet-tasks' }, open.slice(0, 3).map(function (x) {
         return h('a', { href: x.href }, icon('mail'), h('span', null, h('b', null, x.betreff), h('span', null, 'von ' + (x.von ? pname(person(x.von)) : pname(chef)))), icon('chevron'));
       })) : null));
-    if (unreadChat()) add(app, h('a', { class: 'chatping', href: '#/app/chat' }, avatar(person(bundle.chat[0].mit), 'sm'), h('span', null, h('b', null, pname(person(bundle.chat[0].mit)) + ' im Chat'), h('span', null, lastMsg().x)), h('span', { class: 'badge' }, String(unreadChat()))));
-    add(app, codeBox());
+    if (unreadChat()) add(app, h('a', { class: 'chatping', href: '#/app/chat' }, avatar(person(chatsS()[0].mit), 'sm'), h('span', null, h('b', null, pname(person(chatsS()[0].mit)) + ' im Chat'), h('span', null, lastMsg().x)), h('span', { class: 'badge' }, String(unreadChat()))));
 
     if (!LS.get('ln_tour', 0)) {
       var tour = h('section', { class: 'tour' }, h('h2', null, 'Neu im LindnerNet? So findest du dich zurecht'),
@@ -422,19 +498,19 @@
   /* ---------- Mein Arbeitsplatz ---------- */
   function viewArbeitsplatz() {
     add(app, head('Mein Arbeitsplatz', bundle.user.stelle + ' · ' + abt(bundle.user.abt).name));
-    var akt = inbox().filter(function (x) { return !x.arch; }), alt = bundle.modules.filter(function (m) { return !locked(m) && archived(m); }).reverse();
+    var akt = inbox().filter(function (x) { return !x.arch; }), alt = bundle.modules.filter(function (m) { return inS(m) && !locked(m) && archived(m); }).reverse();
     add(app, section('Aktuell im Postfach', ['Alle Nachrichten', '#/postfach'], h('div', { class: 'card list' }, akt.length ? akt.map(function (x) { return x.row(); }) : h('p', { class: 'muted' }, 'Gerade liegt kein neuer Auftrag vor. Unten kannst du abgeschlossene Lernsituationen wiederholen.'))));
     if (alt.length) add(app, section('Abgeschlossen – zum Wiederholen', ['Akademie', '#/akademie'], h('div', { class: 'card list' }, alt.map(lsRow))));
     add(app, section('Meine Apps', null, h('div', { class: 'tiles' }, roleTiles())));
     var tl = visibleTools();
     if (tl.length) add(app, section('Werkzeuge', null, h('div', { class: 'card list' }, tl.map(toolRow))));
-    add(app, codeBox());
+    add(app, modusBar());
     add(app, h('p', { class: 'small muted' }, 'Graue Apps werden im Lauf des Schuljahres freigeschaltet. Die Kalenderwoche (KW) steht darunter.'));
   }
   function viewPostfach() {
     var a = appDef('postfach');
     add(app, [crumb([['Mein Arbeitsplatz', '#/arbeitsplatz'], [a.name]]), head(a.name, a.info),
-      h('div', { class: 'card list' }, inboxRows()), codeBox()]);
+      modusBar(), h('div', { class: 'card list' }, inboxRows())]);
   }
   function wikiFor(modIds) {
     return (bundle.wiki || []).filter(function (w) { var m = mod(w.m); return m && !locked(m) && (!modIds || modIds.indexOf(w.m) >= 0); });
@@ -455,8 +531,8 @@
         h('p', { class: 'muted' }, 'Diese App brauchst du erst später im Schuljahr. Deine aktuellen Aufträge findest du im Postfach.'), h('a', { class: 'btn', href: '#/postfach' }, 'Zum Postfach')));
       return;
     }
-    var mods = (a.mods || []).map(mod).filter(Boolean);
-    var mails = bundle.mails.filter(function (m) { return (m.att || []).some(function (t) { var tt = toolDef(t.tool); return tt && tt.app === a.id; }); });
+    var mods = (a.mods || []).map(mod).filter(Boolean).filter(inS);
+    var mails = bundle.mails.filter(inS).filter(function (m) { return (m.att || []).some(function (t) { var tt = toolDef(t.tool); return tt && tt.app === a.id; }); });
     add(app, section('Aufträge', null, h('div', { class: 'card list' }, mails.map(mailRow), mods.map(taskRow))));
     var tl = visibleTools().filter(function (t) { return t.app === a.id; });
     if (tl.length) add(app, section('Werkzeuge', null, h('div', { class: 'card list' }, tl.map(toolRow))));
@@ -641,6 +717,7 @@
   function applyUnit(u) {
     if (!u || (u.key && bundle._applied[u.key])) return;
     if (u.key) bundle._applied[u.key] = 1;
+    tagStunde(u, u.stunde || { id: u.key || 'einheit', t: 'Stunde' });
     (u.mails || []).forEach(function (m) { bundle.mails.push(m); });
     (u.tools || []).forEach(function (t) { bundle.tools.push(t); });
     (u.news || []).forEach(function (n) { bundle.news.push(n); });
@@ -654,9 +731,9 @@
       if (ex) ex.docs = ex.docs.concat(o.docs); else bundle.ablage.push({ ordner: o.ordner, docs: o.docs.slice() });
     });
   }
-  function applyData(d) {
+  function applyData(d, f) {
     if (d.lehrer) { bundle.lehrer = true; (d.units || []).forEach(applyUnit); }
-    else applyUnit(d);
+    else { applyUnit(d); if (f && d.stunde) bundle.fileStunde[f] = d.stunde.id; }
   }
   function fetchEnc(file) { return fetch('content/' + file + '.enc.json', { cache: 'no-cache' }).then(function (r) { if (!r.ok) throw new Error('fetch'); return r.json(); }); }
   function tryCode(code, files) {
@@ -672,7 +749,7 @@
   function loadUnits() {
     var list = LS.get(ckey(), []), chain = Promise.resolve();
     list.forEach(function (e) {
-      chain = chain.then(function () { return tryCode(e.c, [e.f]); }).then(function (r) { if (r) applyData(r.d); });
+      chain = chain.then(function () { return tryCode(e.c, [e.f]); }).then(function (r) { if (r) applyData(r.d, r.f); });
     });
     return chain.then(null, function () { /* offline ohne Kopie: weiter ohne Einheit */ });
   }
@@ -680,37 +757,66 @@
     LS.set(ckey(), LS.get(ckey(), []).filter(function (e) { return e.f !== bundle.lehrerFile; }));
     LS.del('ln_beamer'); location.hash = '#/'; location.reload();
   }
+  /* Code anwenden: neue Einheiten laden, dann die Stunde des Codes zeigen (Übungscode: Übungsmodus) */
+  function useCode(r) {
+    var have = LS.get(ckey(), []), neu = (r.units || []).filter(function (u) { return !have.some(function (x) { return x.f === u.f; }); });
+    addUnits(neu);
+    return loadUnits().then(function () {
+      var last = (r.units || []).filter(function (u) { return u.f !== bundle.lehrerFile; }).slice(-1)[0];
+      var sid = last ? bundle.fileStunde[last.f] : null, lehrer = (r.units || []).some(function (u) { return u.f === bundle.lehrerFile; });
+      if (sid) setModus('u', sid); else setModus('ue');
+      return { neu: neu.length, lehrer: lehrer, st: aktStunde() };
+    });
+  }
   function codeBox() {
-    if (!unitFiles().length) return null;
-    var input = h('input', { type: 'text', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'Code', 'aria-label': 'Code von der Lehrkraft' });
-    var msg = h('div', { role: 'status', 'aria-live': 'polite' }), btn = h('button', { class: 'btn', type: 'submit' }, 'Freischalten');
+    var input = h('input', { type: 'text', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'Code', 'aria-label': 'Code der heutigen Stunde' });
+    var msg = h('div', { role: 'status', 'aria-live': 'polite' }), btn = h('button', { class: 'btn', type: 'submit' }, 'Los');
     return h('section', { class: 'codebox' }, icon('key'),
-      h('div', null, h('b', null, 'Code von der Lehrkraft?'), h('span', null, 'Damit kommen neue Nachrichten und Aufgaben ins LindnerNet.'),
+      h('div', null, h('b', null, 'Code der heutigen Stunde'), h('span', null, 'Gib den Code ein, den deine Lehrkraft nennt. Dann siehst du genau das, was ihr heute braucht.'),
         h('form', { class: 'code-form', onsubmit: function (e) {
           e.preventDefault(); var c = normCode(input.value); if (!c) return;
           msg.textContent = '';
-          if (LS.get(ckey(), []).some(function (x) { return x.c === c; })) { add(msg, h('p', { class: 'msg ok' }, 'Dieser Code ist schon freigeschaltet.')); return; }
           btn.disabled = true; btn.textContent = 'Prüfe …';
-          tryCode(c, unitFiles()).then(function (r) {
-            btn.disabled = false; btn.textContent = 'Freischalten';
-            if (!r) { add(msg, h('p', { class: 'msg bad' }, 'Dieser Code passt nicht. Prüfe die Schreibweise.')); return; }
-            var l = LS.get(ckey(), []); l.push({ c: c, f: r.f }); LS.set(ckey(), l);
-            applyData(r.d);
-            location.hash = r.d.lehrer ? '#/arbeitsplatz' : '#/postfach'; go();
+          openSlot(c).then(null, function () { return null; }).then(function (r) {
+            if (!r) { btn.disabled = false; btn.textContent = 'Los'; add(msg, h('p', { class: 'msg bad' }, 'Dieser Code passt nicht. Prüfe die Schreibweise.')); return; }
+            useCode(r).then(function (x) { location.hash = x.lehrer ? '#/arbeitsplatz' : '#/'; go(); });
           });
         } }, input, btn), msg));
   }
+  function viewCode() {
+    var u = unterricht(), st = aktStunde() || bundle.stunden[bundle.stunden.length - 1];
+    function seg(val, label, sub, dis) {
+      var on = (val === 'u') === u;
+      return h('button', { type: 'button', class: 'seg' + (on ? ' on' : ''), 'aria-pressed': on ? 'true' : 'false', disabled: dis || null,
+        onclick: function () { if (val === 'u') setModus('u', st.id); else setModus('ue'); go(); } }, h('b', null, label), h('span', null, sub));
+    }
+    add(app, [head('Code & Modus', 'Code der Stunde eingeben und zwischen Unterricht und Üben wechseln'),
+      codeBox(),
+      section('Modus', null, h('div', { class: 'segs', role: 'group', 'aria-label': 'Modus wählen' },
+        seg('u', 'Unterricht', st ? st.t : 'Erst einen Stunden-Code eingeben', !st),
+        seg('ue', 'Üben', 'Alles, was du freigeschaltet hast, dazu die Akademie'))),
+      section('Deine Stunden', null, h('div', { class: 'card list' }, bundle.stunden.slice().reverse().map(function (x) {
+        var akt = u && st && st.id === x.id;
+        return h('button', { type: 'button', class: 'lrow srow' + (akt ? ' on' : ''), onclick: function () { setModus('u', x.id); location.hash = '#/'; } },
+          h('span', { class: 'lrow-i' }, icon(akt ? 'check' : 'calendar')),
+          h('span', { class: 'lrow-t' }, h('b', null, x.t), h('span', null, (x.d || '') + (akt ? (x.d ? ' · ' : '') + 'wird gerade gezeigt' : ''))),
+          icon('chevron'));
+      }))),
+      h('p', { class: 'small muted' }, 'Im Unterricht siehst du nur Nachrichten, Aufträge, Ablage und Werkzeuge der gewählten Stunde. Beim Üben siehst du alles, was du bisher freigeschaltet hast. Dein Lernstand bleibt in beiden Modi gleich.')]);
+  }
+
+
 
   /* ---------- Postfach: Mails und Aufträge ---------- */
   function seen(kind) { return LS.get('ln_' + kind + '_' + bundle.id, {}); }
   function markSeen(kind, id, val) { var s = seen(kind); if (s[id] !== (val || 1)) { s[id] = val || 1; LS.set('ln_' + kind + '_' + bundle.id, s); } }
-  function unreadMails() { var s = seen('mail'); return bundle.mails.filter(function (m) { return !s[m.id]; }); }
-  function unreadChat() { var s = seen('chat'), n = 0; bundle.chat.forEach(function (c) { n += Math.max(0, c.msgs.length - (s[c.id] || 0)); }); return n; }
-  function lastMsg() { var c = bundle.chat[0]; return c.msgs[c.msgs.length - 1]; }
-  function allNews() { return SH.news.concat(bundle.news).sort(function (a, b) { return b.d.localeCompare(a.d); }); }
+  function unreadMails() { var s = seen('mail'); return bundle.mails.filter(function (m) { return inS(m) && !s[m.id]; }); }
+  function unreadChat() { var s = seen('chat'), n = 0; chatsS().forEach(function (c) { n += Math.max(0, c.msgs.length - (s[c.id] || 0)); }); return n; }
+  function lastMsg() { var c = chatsS()[0]; return c.msgs[c.msgs.length - 1]; }
+  function allNews() { return SH.news.concat(bundle.news.filter(inS)).sort(function (a, b) { return b.d.localeCompare(a.d); }); }
   function inbox() {
-    var s = seen('mail'), items = bundle.mails.map(function (m) { return { d: m.d + (m.z || ''), neu: !s[m.id], von: m.von, betreff: m.betreff, href: '#/mail/' + m.id, row: function () { return mailRow(m); } }; });
-    bundle.modules.forEach(function (m) {
+    var s = seen('mail'), items = bundle.mails.filter(inS).map(function (m) { return { d: m.d + (m.z || ''), neu: !s[m.id], von: m.von, betreff: m.betreff, href: '#/mail/' + m.id, row: function () { return mailRow(m); } }; });
+    bundle.modules.filter(inS).forEach(function (m) {
       var meta = (bundle.post || {})[m.id] || {};
       items.push({ arch: !locked(m) && archived(m), d: (meta.d || '') + '99', neu: !locked(m) && !archived(m) && modProgress(m) < 1, von: meta.von, betreff: meta.betreff || m.title, href: '#/m/' + m.id, row: function () { return taskRow(m); } });
     });
@@ -743,8 +849,8 @@
   /* ---------- Chat ---------- */
   function viewChat(a) {
     add(app, h('div', { class: 'apphead' }, h('span', { class: 'tile-i c-' + a.farbe }, icon(a.icon)), h('div', null, h('h1', null, a.name), h('p', { class: 'muted' }, a.info))));
-    if (!bundle.chat.length) { add(app, h('div', { class: 'card empty' }, icon('chat'), h('h2', null, 'Noch keine Nachrichten'), h('p', { class: 'muted' }, 'Sobald dir jemand schreibt, erscheint es hier.'))); return; }
-    bundle.chat.forEach(function (c) {
+    if (!chatsS().length) { add(app, h('div', { class: 'card empty' }, icon('chat'), h('h2', null, 'Noch keine Nachrichten'), h('p', { class: 'muted' }, 'Sobald dir jemand schreibt, erscheint es hier.'))); return; }
+    chatsS().forEach(function (c) {
       var p = person(c.mit), lastDay = '';
       var box = h('div', { class: 'card chatwin' }, h('div', { class: 'chat-h' }, avatar(p), h('span', null, h('b', null, pname(p)), h('span', { class: 'st st-' + p.st }, STATUS[p.st]))));
       var list = h('div', { class: 'chat' });
@@ -766,8 +872,9 @@
   }
   function viewAblage(a) {
     add(app, h('div', { class: 'apphead' }, h('span', { class: 'tile-i c-' + a.farbe }, icon(a.icon)), h('div', null, h('h1', null, a.name), h('p', { class: 'muted' }, a.info))));
-    if (!bundle.ablage.length) { add(app, h('div', { class: 'card empty' }, icon('folder'), h('h2', null, 'Die Ablage ist noch leer'), h('p', { class: 'muted' }, 'Dokumente erscheinen hier, sobald du sie für einen Auftrag brauchst.'))); return; }
-    bundle.ablage.forEach(function (o) {
+    var ordner = bundle.ablage.map(function (o) { return { ordner: o.ordner, docs: o.docs.filter(inS) }; }).filter(function (o) { return o.docs.length; });
+    if (!ordner.length) { add(app, h('div', { class: 'card empty' }, icon('folder'), h('h2', null, unterricht() ? 'Für diese Stunde liegt nichts in der Ablage' : 'Die Ablage ist noch leer'), h('p', { class: 'muted' }, 'Dokumente erscheinen hier, sobald du sie für einen Auftrag brauchst.'))); return; }
+    ordner.forEach(function (o) {
       add(app, section(o.ordner, null, h('div', { class: 'card list' }, o.docs.map(docRow))));
     });
     add(app, h('p', { class: 'small muted' }, icon('shield'), ' Die Ablage enthält nur Unterlagen, die für deinen Auftrag freigegeben sind. Personalakten sieht nur, wer sie für seine Arbeit braucht.'));
@@ -787,7 +894,7 @@
   function toolState(id) { return LS.get('ln_t_' + bundle.id + '_' + id, {}); }
   function setToolState(id, st) { LS.set('ln_t_' + bundle.id + '_' + id, st); }
   function toolLocked(t) { return !bundle.lehrer && t.nach && !toolState(t.nach).done; }
-  function visibleTools() { return bundle.tools; }
+  function visibleTools() { return bundle.tools.filter(inS); }
   var TOOLICON = { detektiv: 'search', quiz: 'check', check: 'file' };
   function toolRow(t) {
     var st = toolState(t.id), d = prog().done['tool:' + t.id], lock = toolLocked(t);
@@ -1127,16 +1234,16 @@
   }
 
   /* ---------- Profil und Datenschutz ---------- */
-  function logout() { LS.del('lb_code'); setBundle(null); location.hash = '#/'; go(); }
+  function logout() { LS.del(K_CODE); LS.del(K_USER); setBundle(null); location.hash = '#/'; go(); }
   function viewIch() {
     var chef = person(bundle.user.chef);
     add(app, [head('Mein Profil'),
-      h('div', { class: 'card profile' }, h('span', { class: 'av xl a-' + bundle.user.abt }, bundle.user.kurz),
+      h('div', { class: 'card profile' }, h('span', { class: 'av xl a-' + bundle.user.abt }, bundle.kuerzel),
         h('div', null, h('h1', null, bundle.user.stelle), h('p', { class: 'muted' }, bundle.user.hinweis)),
         h('dl', { class: 'facts' },
           h('div', null, h('dt', null, 'Abteilung'), h('dd', null, abt(bundle.user.abt).name)),
           h('div', null, h('dt', null, 'Vorgesetzt'), h('dd', null, h('a', { href: '#/person/' + chef.nr }, pname(chef)))),
-          h('div', null, h('dt', null, 'Zugang'), h('dd', null, bundle.short + ' · ohne Namen, ohne Konto')))),
+          h('div', null, h('dt', null, 'Zugang'), h('dd', null, 'Kürzel ' + bundle.kuerzel + ' · ohne Namen, ohne Konto')))),
       h('div', { class: 'card' }, h('h2', null, 'Dieses Gerät'),
         h('p', { class: 'muted' }, 'Dein Lernstand und deine Notizen liegen nur im Browser dieses Geräts. Niemand sonst kann sie sehen, auch deine Lehrkraft nicht.'),
         h('div', { class: 'row' },
@@ -1150,10 +1257,10 @@
       h('div', { class: 'card' }, h('h2', null, 'Was nicht gespeichert wird'),
         ul(['Kein Name, keine E-Mail-Adresse, kein Konto.', 'Keine Auswertung, wer was wann anklickt. Es gibt kein Tracking und keine Werbung.', 'Deine Antworten und Notizen werden nicht gesendet. Auch deine Lehrkraft sieht sie nicht.'])),
       h('div', { class: 'card' }, h('h2', null, 'Was auf deinem Gerät liegt'),
-        ul(['Der Zugangscode deiner Klasse, damit du dich nicht jedes Mal neu anmelden musst.', 'Dein Lernstand, deine Punkte und deine Notizen.', 'Mit „Abmelden“ und „Lernstand löschen“ unter „Mein Profil“ entfernst du alles wieder.']),
+        ul(['Dein Kürzel und der letzte Code, damit du dich nicht jedes Mal neu anmelden musst. Das Kürzel wird nirgendwohin gesendet.', 'Dein Lernstand, deine Punkte und deine Notizen.', 'Mit „Abmelden“ und „Lernstand löschen“ unter „Mein Profil“ entfernst du alles wieder.']),
         h('a', { class: 'btn sec', href: '#/ich' }, 'Mein Profil öffnen')),
       h('div', { class: 'card' }, h('h2', null, 'Technik'),
-        h('p', null, 'Die Seite liegt bei GitHub Pages. Wie bei jeder Website verarbeitet der Anbieter beim Abruf technische Daten wie die IP-Adresse. Die Inhalte sind verschlüsselt und werden erst mit dem Zugangscode auf deinem Gerät lesbar.')),
+        h('p', null, 'Die Seite liegt bei GitHub Pages. Wie bei jeder Website verarbeitet der Anbieter beim Abruf technische Daten wie die IP-Adresse. Die Inhalte sind verschlüsselt und werden erst mit dem Code der Stunde auf deinem Gerät lesbar.')),
       h('div', { class: 'card' }, h('h2', null, 'Wie im echten Betrieb'),
         h('p', null, 'Auch im LindnerNet gilt: Jede Rolle sieht nur, was sie für ihre Arbeit braucht. Im Personenverzeichnis stehen deshalb nur dienstliche Angaben, und bei Abwesenheiten steht kein Grund.'))]);
   }
@@ -1161,8 +1268,8 @@
   /* ---------- Los ---------- */
   window.addEventListener('hashchange', go);
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(function () { /* ohne Offline-Modus weiter */ });
-  var saved = LS.get('lb_code', null);
-  if (saved && window.crypto && crypto.subtle) {
-    unlock(saved).then(function (data) { if (data) { setBundle(data); return loadUnits().then(go); } LS.del('lb_code'); go(); }, function () { go(); });
+  var saved = LS.get(K_CODE, null), savedUser = normUser(LS.get(K_USER, ''));
+  if (saved && savedUser.length === 3 && window.crypto && crypto.subtle) {
+    unlock(saved).then(function (r) { if (r) { setBundle(r.data, savedUser); return loadUnits().then(go); } LS.del(K_CODE); go(); }, function () { go(); });
   } else go();
 })();
